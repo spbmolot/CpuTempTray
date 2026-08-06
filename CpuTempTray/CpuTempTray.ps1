@@ -142,11 +142,55 @@ function Update-Temperature {
     Set-TrayValue $temperature $source
 }
 
+# Autostart runs through Task Scheduler, not the HKCU Run key: reading the CPU
+# temperature needs the PawnIO driver, and PawnIO requires elevation. A Run-key
+# entry starts unelevated, so the tray would always show "--".
+$script:taskName = 'CpuTempTray'
+
+function Test-Elevated {
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
+    return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 function Test-Autostart {
     try {
-        $v = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'CpuTempTray' -ErrorAction SilentlyContinue).CpuTempTray
-        return -not [string]::IsNullOrWhiteSpace($v)
+        $task = Get-ScheduledTask -TaskName $script:taskName -ErrorAction SilentlyContinue
+        return ($null -ne $task) -and ($task.State -ne 'Disabled')
     } catch { return $false }
+}
+
+function Enable-Autostart {
+    $exe = Join-Path $script:appDir 'CpuTempTray.exe'
+    $user = "$env:USERDOMAIN\$env:USERNAME"
+
+    if (Get-ScheduledTask -TaskName $script:taskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $script:taskName -Confirm:$false
+    }
+
+    $action = New-ScheduledTaskAction -Execute $exe -WorkingDirectory $script:appDir
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+    # Interactive logon type is required: a tray icon needs a desktop session.
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -DontStopOnIdleEnd -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -MultipleInstances IgnoreNew
+
+    [void](Register-ScheduledTask -TaskName $script:taskName `
+        -Description 'CPU Temp Tray - real CPU temperature in the notification area (needs admin for PawnIO MSR access)' `
+        -Action $action -Trigger $trigger -Principal $principal -Settings $settings)
+
+    # Drop the legacy Run-key entry so autostart has exactly one owner.
+    Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
+        -Name 'CpuTempTray' -ErrorAction SilentlyContinue
+}
+
+function Disable-Autostart {
+    if (Get-ScheduledTask -TaskName $script:taskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $script:taskName -Confirm:$false
+    }
+    Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
+        -Name 'CpuTempTray' -ErrorAction SilentlyContinue
 }
 
 try {
@@ -174,17 +218,25 @@ try {
     Set-TrayValue -1 'hardware sensor unavailable'
 
     $autostart.Add_Click({
+        if (-not (Test-Elevated)) {
+            [void][System.Windows.Forms.MessageBox]::Show(
+                "Changing autostart requires administrator rights, because the scheduled task must be allowed to run elevated.`r`n`r`nRestart CPU Temp Tray as administrator and try again.",
+                'CPU Temp Tray',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information)
+            $autostart.Checked = Test-Autostart
+            return
+        }
         try {
-            $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-            if (Test-Autostart) {
-                Remove-ItemProperty $runKey -Name 'CpuTempTray' -ErrorAction SilentlyContinue
-                $autostart.Checked = $false
-            } else {
-                $exe = Join-Path $script:appDir 'CpuTempTray.exe'
-                Set-ItemProperty $runKey -Name 'CpuTempTray' -Value ('"' + $exe + '"')
-                $autostart.Checked = $true
-            }
-        } catch { }
+            if (Test-Autostart) { Disable-Autostart } else { Enable-Autostart }
+        } catch {
+            [void][System.Windows.Forms.MessageBox]::Show(
+                "Could not change autostart.`r`n`r`n$($_.Exception.Message)",
+                'CPU Temp Tray',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error)
+        }
+        $autostart.Checked = Test-Autostart
     })
 
     $exitItem.Add_Click({ [System.Windows.Forms.Application]::Exit() })
