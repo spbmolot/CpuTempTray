@@ -1,0 +1,25 @@
+Сторонние компоненты CPU Temp Tray
+==================================
+
+Все компоненты распространяются без изменений. Для каждого указан проект,
+на странице которого находится полный текст лицензии.
+
+LibreHardwareMonitorLib.dll
+  https://github.com/LibreHardwareMonitor/LibreHardwareMonitor
+  Лицензия: MPL-2.0 (текст — LICENSE-LibreHardwareMonitor.txt)
+
+PawnIO_setup.exe (драйвер PawnIO)
+  https://github.com/namazso/PawnIO
+  Лицензия: см. страницу проекта
+
+HidSharp.dll
+  https://github.com/IntergatedCircuits/HidSharp
+  Лицензия: Apache-2.0
+
+BlackSharp.Core.dll, DiskInfoToolkit.dll, RAMSPDToolkit-NDD.dll
+  https://github.com/Blacktempel
+  Лицензия: см. страницы соответствующих проектов
+
+System.*.dll, Microsoft.Bcl.*.dll
+  .NET Foundation, https://github.com/dotnet/runtime
+  Лицензия: MIT

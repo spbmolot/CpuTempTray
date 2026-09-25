@@ -1,3 +1,10 @@
+# -NoElevate: set by our own elevated relaunch so it never tries to elevate again.
+# -WaitForPrevious: the relaunch waits for the instance that started it to exit.
+param(
+    [switch]$NoElevate,
+    [switch]$WaitForPrevious
+)
+
 $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -20,10 +27,47 @@ $script:currentIcon = $null
 $script:lastTemp = [int]::MinValue
 $script:lastSource = ''
 
-$createdNew = $false
-$mutex = [System.Threading.Mutex]::new($true, 'Local\CpuTempTray.Hardware.Sensor.v3', [ref]$createdNew)
-if (-not $createdNew) {
-    $mutex.Dispose()
+function Test-Elevated {
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
+    return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# Relaunches this script elevated. Returns $false if UAC was cancelled.
+function Start-Elevated([switch]$WaitForPrevious) {
+    $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -NoElevate"
+    if ($WaitForPrevious) { $arguments += ' -WaitForPrevious' }
+    try {
+        Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $arguments -Verb RunAs -WindowStyle Hidden
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+# Reading the CPU temperature needs admin rights (PawnIO), so ask for them up
+# front. If UAC is cancelled, keep running unelevated: the tray shows "--" and
+# offers "Restart as administrator".
+if (-not $NoElevate -and -not (Test-Elevated)) {
+    if (Start-Elevated) { exit }
+}
+
+$mutex = $null
+$ownsMutex = $false
+try {
+    $mutex = [System.Threading.Mutex]::new($false, 'Local\CpuTempTray.Hardware.Sensor.v3')
+    $timeout = if ($WaitForPrevious) { 10000 } else { 0 }
+    try {
+        $ownsMutex = $mutex.WaitOne($timeout)
+    } catch [System.Threading.AbandonedMutexException] {
+        $ownsMutex = $true
+    }
+} catch {
+    # An unelevated process cannot open the mutex of an elevated instance;
+    # either way another instance is already running.
+}
+if (-not $ownsMutex) {
+    if ($null -ne $mutex) { $mutex.Dispose() }
     exit
 }
 
@@ -146,28 +190,44 @@ function Update-Temperature {
 # temperature needs the PawnIO driver, and PawnIO requires elevation. A Run-key
 # entry starts unelevated, so the tray would always show "--".
 $script:taskName = 'CpuTempTray'
+$script:exePath = Join-Path $script:appDir 'CpuTempTray.exe'
 
-function Test-Elevated {
-    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
-    return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+# Owner of the desktop (explorer.exe) in this session. Differs from the process
+# user when elevation was done with another administrator's credentials.
+function Get-SessionUser {
+    try {
+        $sessionId = (Get-Process -Id $PID).SessionId
+        $explorer = Get-CimInstance Win32_Process -Filter "Name = 'explorer.exe' AND SessionId = $sessionId" |
+            Select-Object -First 1
+        if ($null -ne $explorer) {
+            $owner = Invoke-CimMethod -InputObject $explorer -MethodName GetOwner
+            if ($owner.ReturnValue -eq 0) { return "$($owner.Domain)\$($owner.User)" }
+        }
+    } catch { }
+    return $null
 }
 
+# True only if the task exists, is enabled and still points at this copy of
+# the program (the folder may have been moved since the task was created).
 function Test-Autostart {
     try {
         $task = Get-ScheduledTask -TaskName $script:taskName -ErrorAction SilentlyContinue
-        return ($null -ne $task) -and ($task.State -ne 'Disabled')
+        if ($null -eq $task -or $task.State -eq 'Disabled') { return $false }
+        $matching = @($task.Actions | Where-Object { $_.Execute -and $_.Execute.Trim('"') -eq $script:exePath })
+        return $matching.Count -gt 0
     } catch { return $false }
 }
 
 function Enable-Autostart {
-    $exe = Join-Path $script:appDir 'CpuTempTray.exe'
     $user = "$env:USERDOMAIN\$env:USERNAME"
-
-    if (Get-ScheduledTask -TaskName $script:taskName -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $script:taskName -Confirm:$false
+    $sessionUser = Get-SessionUser
+    if ($null -ne $sessionUser -and $sessionUser -ne $user) {
+        throw "CPU Temp Tray is elevated as '$user', but you are signed in as '$sessionUser'. " +
+              "An elevated logon task only works for an account that is itself an administrator; " +
+              "sign in with an administrator account to enable autostart."
     }
 
+    $exe = $script:exePath
     $action = New-ScheduledTaskAction -Execute $exe -WorkingDirectory $script:appDir
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
     # Interactive logon type is required: a tray icon needs a desktop session.
@@ -176,7 +236,9 @@ function Enable-Autostart {
         -DontStopOnIdleEnd -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -MultipleInstances IgnoreNew
 
-    [void](Register-ScheduledTask -TaskName $script:taskName `
+    # -Force replaces an existing task in one step, so a failure never leaves
+    # the user without the previous autostart entry.
+    [void](Register-ScheduledTask -TaskName $script:taskName -Force `
         -Description 'CPU Temp Tray - real CPU temperature in the notification area (needs admin for PawnIO MSR access)' `
         -Action $action -Trigger $trigger -Principal $principal -Settings $settings)
 
@@ -193,6 +255,11 @@ function Disable-Autostart {
         -Name 'CpuTempTray' -ErrorAction SilentlyContinue
 }
 
+# Hands over to an elevated copy; it waits for this one to release the mutex.
+function Restart-Elevated {
+    if (Start-Elevated -WaitForPrevious) { [System.Windows.Forms.Application]::Exit() }
+}
+
 try {
     Install-PawnIOIfNeeded
 
@@ -207,6 +274,11 @@ try {
     $autostart = [System.Windows.Forms.ToolStripMenuItem]::new('Start with Windows')
     $autostart.Checked = Test-Autostart
     [void]$menu.Items.Add($autostart)
+    if (-not (Test-Elevated)) {
+        $restartItem = [System.Windows.Forms.ToolStripMenuItem]::new('Restart as administrator')
+        $restartItem.Add_Click({ Restart-Elevated })
+        [void]$menu.Items.Add($restartItem)
+    }
     [void]$menu.Items.Add([System.Windows.Forms.ToolStripSeparator]::new())
     $exitItem = [System.Windows.Forms.ToolStripMenuItem]::new('Exit')
     [void]$menu.Items.Add($exitItem)
@@ -219,11 +291,12 @@ try {
 
     $autostart.Add_Click({
         if (-not (Test-Elevated)) {
-            [void][System.Windows.Forms.MessageBox]::Show(
-                "Changing autostart requires administrator rights, because the scheduled task must be allowed to run elevated.`r`n`r`nRestart CPU Temp Tray as administrator and try again.",
+            $answer = [System.Windows.Forms.MessageBox]::Show(
+                "Changing autostart requires administrator rights, because the scheduled task must be allowed to run elevated.`r`n`r`nRestart CPU Temp Tray as administrator now?",
                 'CPU Temp Tray',
-                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
                 [System.Windows.Forms.MessageBoxIcon]::Information)
+            if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) { Restart-Elevated }
             $autostart.Checked = Test-Autostart
             return
         }
@@ -243,7 +316,8 @@ try {
 
     $script:timer = [System.Windows.Forms.Timer]::new()
     $script:timer.Interval = 2000
-    $script:timer.Add_Tick({ Update-Temperature })
+    # An exception escaping a timer tick would take the whole tray down.
+    $script:timer.Add_Tick({ try { Update-Temperature } catch { } })
     Update-Temperature
     $script:timer.Start()
 
@@ -259,5 +333,6 @@ try {
     if ($null -ne $script:notify) { $script:notify.Visible = $false; $script:notify.Dispose() }
     if ($null -ne $script:currentIcon) { $script:currentIcon.Dispose() }
     if ($null -ne $script:computer) { try { $script:computer.Close() } catch { } }
-    if ($null -ne $mutex) { $mutex.ReleaseMutex(); $mutex.Dispose() }
+    if ($ownsMutex) { $mutex.ReleaseMutex() }
+    $mutex.Dispose()
 }
